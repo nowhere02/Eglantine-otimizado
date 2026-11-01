@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <array>
 #include <cstdlib>
@@ -2129,30 +2130,52 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
     }
 }
 
-void TextureCacheRuntime::TickFrame() {
-    static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
+u64 TextureCacheRuntime::PendingTranscode::SizeBytes() const noexcept {
+    u64 bytes{};
+    for (u32 level = 0; level < levels; ++level) {
+        bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+    }
+    return bytes * layers;
+}
+
+void TextureCacheRuntime::ReclaimCompletedTranscodes() {
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
     u64 free_bytes{};
     for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
+        free_bytes += t.SizeBytes();
     }
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
         PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
+        const u64 bytes = done.SizeBytes();
+        ASSERT(pending_transcode_bytes >= bytes);
+        pending_transcode_bytes -= bytes;
         if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
             done.unused_frames = 0;
             free_bytes += bytes;
             free_transcodes.push_back(std::move(done));
         }
         pending_transcodes.pop_front();
+    }
+}
+
+u64 TextureCacheRuntime::TranscodeBudgetBytes() const noexcept {
+    const u64 total = device.GetDeviceLocalMemory();
+    const u64 target = total != 0 ? total / 10 : u64{512} << 20;
+    return std::clamp(target, u64{256} << 20, u64{1024} << 20);
+}
+
+void TextureCacheRuntime::TickFrame() {
+    static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+    ReclaimCompletedTranscodes();
+    if (++transcode_frames % 600 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "ASTC temporary images: {} MiB pending, {} MiB peak, {} MiB budget, {} waits ({} us), {} early submits",
+                 pending_transcode_bytes >> 20, peak_transcode_bytes >> 20,
+                 TranscodeBudgetBytes() >> 20, transcode_budget_waits, transcode_wait_us,
+                 transcode_early_submits);
+        peak_transcode_bytes = pending_transcode_bytes;
+        transcode_budget_waits = transcode_wait_us = 0;
+        transcode_early_submits = 0;
     }
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
@@ -4127,6 +4150,7 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    ReclaimCompletedTranscodes();
     const ImageInfo& info = image.info;
     const u32 width = info.size.width;
     const u32 height = info.size.height;
@@ -4231,7 +4255,28 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
+    const u64 bytes = pending.SizeBytes();
+    transcode_submission_batch.Record(pending.tick, bytes);
+    pending_transcode_bytes += bytes;
+    peak_transcode_bytes = (std::max)(peak_transcode_bytes, pending_transcode_bytes);
     pending_transcodes.push_back(std::move(pending));
+    const u64 budget = TranscodeBudgetBytes();
+    if (transcode_submission_batch.ShouldSubmitEarly(pending_transcode_bytes, budget,
+                                                     pending_transcodes.front().tick,
+                                                     scheduler.CurrentTick())) {
+        scheduler.Flush();
+        ++transcode_early_submits;
+    }
+    while (pending_transcode_bytes > budget && !pending_transcodes.empty()) {
+        const u64 wait_tick = pending_transcodes.front().tick;
+        const auto begin = std::chrono::steady_clock::now();
+        scheduler.Wait(wait_tick);
+        ++transcode_budget_waits;
+        transcode_wait_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - begin)
+                                                   .count());
+        ReclaimCompletedTranscodes();
+    }
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {

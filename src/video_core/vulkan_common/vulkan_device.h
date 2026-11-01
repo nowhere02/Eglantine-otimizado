@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -1016,6 +1017,11 @@ FN_MAX_LIMIT_LIST
     }
 
     u64 GetDeviceMemoryUsage() const;
+
+    [[nodiscard]] bool TracksMemoryHeap(size_t heap) const noexcept {
+        return std::find(valid_heap_memory.begin(), valid_heap_memory.end(), heap) !=
+               valid_heap_memory.end();
+    }
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its

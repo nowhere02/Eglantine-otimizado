@@ -7,12 +7,18 @@
 #include <algorithm>
 #include <cstddef>
 #include <iterator>
+#include <memory>
+#include <string_view>
 #include <utility>
 #include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/string_util.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 
@@ -81,6 +87,56 @@ constexpr FS::FileAccessMode ModeFlagsToFileAccessMode(OpenMode mode) {
         return {};
     }
 }
+
+#ifdef _WIN32
+template <typename Callback>
+bool ForEachWindowsEntry(const std::string& path, Callback&& callback) {
+    // Keep the existing validation for drive-relative roots such as C:.
+    if (path.size() == 2 && path[1] == ':') {
+        return false;
+    }
+    const std::filesystem::path directory{Common::UTF8ToUTF16W(path)};
+    if (!FS::ValidatePath(directory)) {
+        return true;
+    }
+    WIN32_FIND_DATAW data{};
+    const auto pattern = (directory / L"*").wstring();
+    const HANDLE raw_handle = FindFirstFileW(pattern.c_str(), &data);
+    if (raw_handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const std::unique_ptr<void, decltype(&FindClose)> handle{raw_handle, &FindClose};
+    do {
+        const std::wstring_view name{data.cFileName};
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+        bool is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        u64 size = (u64{data.nFileSizeHigh} << 32) | data.nFileSizeLow;
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            const auto entry_path = directory / data.cFileName;
+            std::error_code ec;
+            const auto status = std::filesystem::status(entry_path, ec);
+            if (ec || (!std::filesystem::is_directory(status) &&
+                       !std::filesystem::is_regular_file(status))) {
+                continue;
+            }
+            is_directory = std::filesystem::is_directory(status);
+            if (!is_directory) {
+                size = std::filesystem::file_size(entry_path, ec);
+                if (ec) {
+                    continue;
+                }
+            }
+        }
+        callback(name, is_directory, size);
+    } while (FindNextFileW(handle.get(), &data));
+    if (const DWORD error = GetLastError(); error != ERROR_NO_MORE_FILES) {
+        LOG_WARNING(Common_Filesystem, "Directory enumeration failed for {}: {}", path, error);
+    }
+    return true;
+}
+#endif
 
 } // Anonymous namespace
 
@@ -395,6 +451,19 @@ std::vector<VirtualFile> RealVfsDirectory::IterateEntries<RealVfsFile, VfsFile>(
 
     std::vector<VirtualFile> out;
 
+#ifdef _WIN32
+    const std::string prefix = path + '/';
+    if (ForEachWindowsEntry(path, [this, &out, &prefix](std::wstring_view name, bool is_directory,
+                                                        u64 size) {
+            if (!is_directory) {
+                out.emplace_back(base.OpenFileFromEntry(prefix + Common::UTF16ToUTF8(name), size,
+                                                        perms));
+            }
+        })) {
+        return out;
+    }
+#endif
+
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
         const auto full_path_string = FS::PathToUTF8String(entry.path());
@@ -417,6 +486,18 @@ std::vector<VirtualDir> RealVfsDirectory::IterateEntries<RealVfsDirectory, VfsDi
 
     std::vector<VirtualDir> out;
 
+#ifdef _WIN32
+    const std::string prefix = path + '/';
+    if (ForEachWindowsEntry(path, [this, &out, &prefix](std::wstring_view name, bool is_directory,
+                                                        u64) {
+            if (is_directory) {
+                out.emplace_back(base.OpenDirectory(prefix + Common::UTF16ToUTF8(name), perms));
+            }
+        })) {
+        return out;
+    }
+#endif
+
     const FS::DirEntryCallable callback = [this,
                                            &out](const std::filesystem::directory_entry& entry) {
         const auto full_path_string = FS::PathToUTF8String(entry.path());
@@ -435,7 +516,7 @@ RealVfsDirectory::RealVfsDirectory(RealVfsFilesystem& base_, const std::string& 
                                    OpenMode perms_)
     : base(base_), path(FS::RemoveTrailingSlash(path_)), parent_path(FS::GetParentPath(path)),
       path_components(FS::SplitPathComponentsCopy(path)), perms(perms_) {
-    if (!FS::Exists(path) && True(perms & OpenMode::Write)) {
+    if (True(perms & OpenMode::Write) && !FS::Exists(path)) {
         void(FS::CreateDirs(path));
     }
 }

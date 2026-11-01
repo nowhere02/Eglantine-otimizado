@@ -17,8 +17,13 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/dynarmic_code_memory.cpp
+    core/vfs_windows_enumeration.cpp
     core/internal_network/network.cpp
+    shader_recompiler/compilation_memory.cpp
     video_core/memory_tracker.cpp
+    video_core/staging_buffer_policy.cpp
+    video_core/transcode_budget_policy.cpp
     video_core/ampere_returns.cpp
     input_common/calibration_configuration_job.cpp
 )
@@ -27,6 +32,9 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+if (TARGET dynarmic)
+    target_link_libraries(tests PRIVATE dynarmic)
+endif()
 
 add_test(NAME tests COMMAND tests)
 

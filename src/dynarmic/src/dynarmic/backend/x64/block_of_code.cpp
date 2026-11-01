@@ -61,7 +61,6 @@ namespace {
 constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
 constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
 #ifdef _WIN32
-constexpr size_t COMMIT_STEP = 4 * 1024 * 1024;
 
 // Reserves the code space; EnsureMemoryCommitted commits it as code is emitted. Xbyak's default
 // allocator commits all of it up front: 512 MiB per core, 3 GiB of commit charge for six cores
@@ -234,14 +233,20 @@ size_t BlockOfCode::SpaceRemaining() const {
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #ifdef _WIN32
     if (committed_size < size_ + codesize) {
-        // The code space is only reserved (CodeAllocator), so everything up to the end of the next
-        // emission has to be committed; in steps, as each VirtualAlloc call is a kernel call.
-        committed_size = std::min<size_t>(maxSize_, (std::max)(committed_size + COMMIT_STEP, size_ + codesize));
+        const size_t required = (std::min)(maxSize_, size_ + codesize);
+        const size_t next_size = (std::min)(maxSize_, (required + 65535) & ~size_t{65535});
+        if (next_size == committed_size) {
+            return;
+        }
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_READWRITE);
+        constexpr DWORD protection = PAGE_READWRITE;
 #    else
-        VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        constexpr DWORD protection = PAGE_EXECUTE_READWRITE;
 #    endif
+        if (!VirtualAlloc(top_ + committed_size, next_size - committed_size, MEM_COMMIT, protection)) {
+            throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
+        }
+        committed_size = next_size;
     }
 #endif
 }

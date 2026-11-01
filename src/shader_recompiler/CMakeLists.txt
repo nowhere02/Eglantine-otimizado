@@ -30,6 +30,7 @@ add_library(shader_recompiler STATIC
     backend/spirv/emit_spirv_warp.cpp
     backend/spirv/spirv_emit_context.cpp
     backend/spirv/spirv_emit_context.h
+    compilation_budget.h
     environment.h
     exception.h
     frontend/ir/abstract_syntax_list.h
