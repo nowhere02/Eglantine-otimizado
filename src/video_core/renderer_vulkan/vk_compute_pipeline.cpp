@@ -151,6 +151,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
+    if (info.storage_buffers_descriptors.size() > VideoCommon::NUM_COMPUTE_STORAGE_BUFFERS) {
+        LOG_ERROR(Render_Vulkan, "Compute shader needs {} storage buffers, maximum is {}",
+                  info.storage_buffers_descriptors.size(), VideoCommon::NUM_COMPUTE_STORAGE_BUFFERS);
+        return false;
+    }
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);

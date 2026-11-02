@@ -233,7 +233,6 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
         name = control->GetApplicationName();
     }
 
-    romfs = FindLooseRomFS(file_dir);
     if (const auto title_dir = file_dir->GetParentDirectory()) {
         romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
     }
@@ -245,7 +244,15 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
     , dir(std::move(directory))
     , override_update(override_update_)
 {
-    romfs = FindLooseRomFS(dir);
+}
+
+void AppLoader_DeconstructedRomDirectory::EnsureRomFSLoaded() {
+    if (romfs_initialized) {
+        return;
+    }
+    const auto exefs_dir = dir != nullptr ? dir : file->GetContainingDirectory();
+    romfs = FindLooseRomFS(exefs_dir);
+    romfs_initialized = true;
 }
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
@@ -283,6 +290,9 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     if (result != ResultStatus::Success) {
         return {result, {}};
     }
+
+    // Metadata-only loader instances do not need to build a loose RomFS.
+    EnsureRomFSLoaded();
 
     if (override_update) {
         const FileSys::PatchManager patch_manager(
@@ -414,6 +424,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 }
 
 ResultStatus AppLoader_DeconstructedRomDirectory::ReadRomFS(FileSys::VirtualFile& out_dir) {
+    EnsureRomFSLoaded();
     if (romfs == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }

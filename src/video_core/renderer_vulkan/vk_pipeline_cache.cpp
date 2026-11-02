@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <bit>
 #include <numeric>
@@ -19,9 +20,11 @@
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/memory_detect.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/compilation_budget.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
@@ -306,9 +309,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 }
 
 size_t GetTotalPipelineWorkers() {
+#ifdef __ANDROID__
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
-#ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
     const size_t desired = static_cast<size_t>(clamped);
@@ -317,7 +320,11 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
-    return max_core_threads;
+    const size_t count = Shader::CompilationWorkerCount(
+        std::thread::hardware_concurrency(), Common::GetMemInfo().TotalPhysicalMemory);
+    LOG_INFO(Render_Vulkan, "Pipeline compiler: {} workers (CPU and physical memory budget)",
+             count);
+    return count;
 #endif
 }
 
@@ -610,6 +617,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (title_id == 0) {
         return;
     }
+    const auto warmup_start = std::chrono::steady_clock::now();
     if (!pipeline_cache_filename.empty()) {
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
@@ -638,7 +646,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         size_t built{};
         bool has_loaded{};
         std::unique_ptr<PipelineStatistics> statistics;
+        std::unordered_map<std::thread::id, std::unique_ptr<ShaderPools>> worker_pools;
     } state;
+
+    const auto get_worker_pools = [&state]() -> ShaderPools& {
+        std::scoped_lock lock{state.mutex};
+        auto& pools = state.worker_pools[std::this_thread::get_id()];
+        if (!pools) {
+            pools = std::make_unique<ShaderPools>();
+        }
+        return *pools;
+    };
 
     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
         state.statistics = std::make_unique<PipelineStatistics>(device);
@@ -647,8 +665,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
 
-        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
-            ShaderPools pools;
+        workers.QueueWork([this, key, env_ = std::move(env), &state, &callback,
+                           &get_worker_pools]() mutable {
+            ShaderPools& pools = get_worker_pools();
+            pools.ReleaseContents();
             auto pipeline{CreateComputePipeline(pools, key, env_, state.statistics.get(), false)};
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
@@ -693,8 +713,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
-            ShaderPools pools;
+        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback,
+                           &get_worker_pools]() mutable {
+            ShaderPools& pools = get_worker_pools();
+            pools.ReleaseContents();
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
@@ -715,6 +737,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
+    const auto queued_at = std::chrono::steady_clock::now();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
 
@@ -724,6 +747,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     lock.unlock();
 
     workers.WaitForRequests(stop_loading);
+    const auto pool_count = state.worker_pools.size();
+    state.worker_pools.clear();
+    const auto warmup_end = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [](auto duration) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    };
+    LOG_INFO(Render_Vulkan,
+             "Pipeline warmup: {} entries, {} built, {} ms total ({} ms reading and queueing, {} ms waiting); {} worker pools",
+             state.total, state.built, elapsed_ms(warmup_end - warmup_start),
+             elapsed_ms(queued_at - warmup_start), elapsed_ms(warmup_end - queued_at), pool_count);
 
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,

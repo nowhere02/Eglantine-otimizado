@@ -685,9 +685,9 @@ class Image {
 public:
     explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
                    VmaAllocator allocator_, VmaAllocation allocation_,
-                   const DeviceDispatch& dld_) noexcept
+                   const DeviceDispatch& dld_, VkDeviceSize device_memory_size_) noexcept
         : handle{handle_}, usage{usage_}, owner{owner_}, allocator{allocator_},
-          allocation{allocation_}, dld{&dld_} {}
+          allocation{allocation_}, dld{&dld_}, device_memory_size{device_memory_size_} {}
     Image() = default;
 
     /// True for an image created without memory (an unbacked sparse image).
@@ -695,12 +695,18 @@ public:
         return handle != VK_NULL_HANDLE && allocation == VK_NULL_HANDLE;
     }
 
+    /// Allocation bytes in the heaps included in the device's reported memory usage.
+    [[nodiscard]] VkDeviceSize DeviceMemorySize() const noexcept {
+        return handle ? device_memory_size : 0;
+    }
+
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 
     Image(Image&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld},
+          device_memory_size{rhs.device_memory_size} {}
 
     Image& operator=(Image&& rhs) noexcept {
         Release();
@@ -710,6 +716,7 @@ public:
         allocator = rhs.allocator;
         allocation = rhs.allocation;
         dld = rhs.dld;
+        device_memory_size = rhs.device_memory_size;
         return *this;
     }
 
@@ -745,6 +752,7 @@ private:
     VmaAllocator allocator = nullptr;
     VmaAllocation allocation = nullptr;
     const DeviceDispatch* dld = nullptr;
+    VkDeviceSize device_memory_size{};
 };
 
 struct MemoryLocation {

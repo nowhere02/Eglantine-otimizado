@@ -6,6 +6,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#ifdef _WIN32
+#include <array>
+#include <barrier>
+#include <thread>
+#include <windows.h>
+#endif
+
 #include "common/host_memory.h"
 #include "common/literals.h"
 
@@ -16,6 +23,95 @@ static constexpr size_t VIRTUAL_SIZE = 1ULL << 39;
 static constexpr size_t BACKING_SIZE = 4_GiB;
 static constexpr auto PERMS = Common::MemoryPermission::ReadWrite;
 static constexpr auto HEAP = false;
+
+#ifdef _WIN32
+TEST_CASE("HostMemory: large backing is committed on demand", "[common][host-memory-lazy]") {
+    HostMemory mem(20_GiB, VIRTUAL_SIZE);
+    auto* backing = mem.BackingBasePointer();
+    REQUIRE(backing != nullptr);
+    MEMORY_BASIC_INFORMATION info{};
+    REQUIRE(VirtualQuery(backing, &info, sizeof(info)) != 0);
+    REQUIRE(info.State == MEM_RESERVE);
+    REQUIRE(info.Type == MEM_MAPPED);
+
+    volatile u8* first_page = backing;
+    SetLastError(ERROR_CRC);
+    first_page[0] = 23;
+    const DWORD error_after_fault = GetLastError();
+    REQUIRE(error_after_fault == ERROR_CRC);
+    REQUIRE(backing[0] == 23);
+    REQUIRE(VirtualQuery(backing, &info, sizeof(info)) != 0);
+    REQUIRE(info.State == MEM_COMMIT);
+    REQUIRE(VirtualQuery(backing + 20_GiB - 1, &info, sizeof(info)) != 0);
+    REQUIRE(info.State == MEM_RESERVE);
+
+    mem.Map(0x5000, 0x100000, 0x3000, PERMS, HEAP);
+    volatile u8* view = mem.VirtualBasePointer() + 0x5000;
+    view[0x1234] = 76;
+    REQUIRE(backing[0x101234] == 76);
+}
+
+TEST_CASE("HostMemory: concurrent first touches preserve shared mappings", "[common][host-memory-lazy]") {
+    HostMemory mem(4_MiB, VIRTUAL_SIZE);
+    for (size_t wave = 0; wave < 32; ++wave) {
+        const size_t view_offset = 0x10000 + wave * 0x10000;
+        const size_t backing_offset = 0x100000 + wave * 0x10000;
+        mem.Map(view_offset, backing_offset, 0x1000, PERMS, HEAP);
+        auto* view = reinterpret_cast<volatile u64*>(mem.VirtualBasePointer() + view_offset);
+        std::barrier start{8};
+        std::array<std::jthread, 8> threads;
+        for (size_t index = 0; index < threads.size(); ++index) {
+            threads[index] = std::jthread{[&, index] {
+                start.arrive_and_wait();
+                view[index] = index + 10;
+            }};
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        const auto* backing = reinterpret_cast<const u64*>(mem.BackingBasePointer() + backing_offset);
+        for (size_t index = 0; index < threads.size(); ++index) {
+            REQUIRE(backing[index] == index + 10);
+        }
+    }
+}
+
+TEST_CASE("HostMemory: protection can precede first access", "[common][host-memory-lazy]") {
+    HostMemory mem(4_MiB, VIRTUAL_SIZE);
+    mem.Map(0x10000, 0x20000, 0x3000, PERMS, HEAP);
+    mem.Protect(0x10000, 0x3000, Common::MemoryPermission::Read);
+    volatile u8* view = mem.VirtualBasePointer() + 0x10000;
+    REQUIRE(view[0] == 0);
+    MEMORY_BASIC_INFORMATION info{};
+    REQUIRE(VirtualQuery(const_cast<u8*>(view), &info, sizeof(info)) != 0);
+    REQUIRE(info.Protect == PAGE_READONLY);
+    mem.Protect(0x10000, 0x3000, PERMS);
+    view[0] = 57;
+    REQUIRE(mem.BackingBasePointer()[0x20000] == 57);
+}
+
+TEST_CASE("HostMemory: zeroing preserves untouched backing and clears dirty aliases",
+          "[common][host-memory-lazy]") {
+    HostMemory mem(4_MiB, VIRTUAL_SIZE);
+    auto* backing = mem.BackingBasePointer();
+    mem.ClearBackingRegion(0, 4_MiB, 0);
+    MEMORY_BASIC_INFORMATION info{};
+    REQUIRE(VirtualQuery(backing, &info, sizeof(info)) != 0);
+    REQUIRE(info.State == MEM_RESERVE);
+
+    mem.Map(0x10000, 0, 0x1000, PERMS, HEAP);
+    volatile u8* view = mem.VirtualBasePointer() + 0x10000;
+    view[0x180] = 91;
+    mem.ClearBackingRegion(0x100, 0x100, 0);
+    REQUIRE(view[0x180] == 0);
+    mem.ClearBackingRegion(0x100, 0x100, 0xab);
+    REQUIRE(view[0x100] == 0xab);
+    REQUIRE(view[0xff] == 0);
+    REQUIRE(view[0x200] == 0);
+    REQUIRE(VirtualQuery(backing + 4_MiB - 1, &info, sizeof(info)) != 0);
+    REQUIRE(info.State == MEM_RESERVE);
+}
+#endif
 
 TEST_CASE("HostMemory: Initialize and deinitialize", "[common]") {
     {

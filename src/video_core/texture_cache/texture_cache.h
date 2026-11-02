@@ -26,6 +26,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/cache_entry.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
@@ -259,7 +260,8 @@ void TextureCache<P>::TickFrame() {
         std::vector<std::pair<u64, const Image*>> largest;
         std::map<u32, std::pair<u64, u32>> by_format;
         for (const auto [image_id, image] : slot_images) {
-            const u64 bytes = GetScaledImageSizeBytes(*image);
+            const u64 bytes = ImageMemoryBytes(*image) +
+                              (image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0);
             image_bytes += bytes;
             ++images;
             largest.emplace_back(bytes, image);
@@ -270,6 +272,11 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
                  image_bytes >> 20);
+        ASSERT(slot_image_allocs.size() == image_allocs_table.size());
+        ASSERT(slot_framebuffers.size() == framebuffers.size());
+        LOG_INFO(HW_GPU, "Cache records: {} image allocations / {} lookups; {} framebuffers / {} lookups",
+                 slot_image_allocs.size(), image_allocs_table.size(), slot_framebuffers.size(),
+                 framebuffers.size());
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
@@ -1722,7 +1729,10 @@ void TextureCache<P>::InvalidateScale(Image& image) {
 }
 
 template <class P>
-u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
+u64 TextureCache<P>::GetScaledImageSizeBytes(const Image& image) {
+    if constexpr (requires { image.ScaledMemoryBytes(); }) {
+        return image.ScaledMemoryBytes();
+    }
     const u64 scale_up = static_cast<u64>(Settings::values.resolution_info.up_scale *
                                           Settings::values.resolution_info.up_scale);
     const u64 down_shift = static_cast<u64>(Settings::values.resolution_info.down_shift +
@@ -1736,6 +1746,9 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 
 template <class P>
 u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+    if constexpr (requires { image.MemoryBytes(); }) {
+        return image.MemoryBytes();
+    }
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // No device memory but what BindLayers gave a SparseLayers image: at its full size (GBs
         // for title 1's sparse terrain images), deleting it would look to the collector like
@@ -2705,6 +2718,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 return;
             }
             image_ids.erase(vector_it);
+            if (image_ids.empty()) {
+                selected_page_table.erase(page_it);
+            }
         };
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
         clear_page_table(page, (*channel_state->gpu_page_table));
@@ -2725,6 +2741,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 return;
             }
             image_map_ids.erase(vector_it);
+            if (image_map_ids.empty()) {
+                page_table.erase(page_it);
+            }
         });
         slot_map_views.erase(map_id);
         return;
@@ -2735,11 +2754,12 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     auto it = sparse_views.find(image_id);
     ASSERT(it != sparse_views.end());
     auto& sparse_maps = it->second;
+    std::vector<u64> empty_pages;
     for (auto& map_view_id : sparse_maps) {
         const auto& map_range = slot_map_views[map_view_id];
         const DAddr cpu_addr = map_range.cpu_addr;
         const std::size_t size = map_range.size;
-        ForEachCPUPage(cpu_addr, size, [this, image_id](u64 page) {
+        ForEachCPUPage(cpu_addr, size, [this, image_id, &empty_pages](u64 page) {
             const auto page_it = page_table.find(page);
             if (page_it == page_table.end()) {
                 ASSERT_MSG(false, "Unregistering unregistered page={:#x}", page << YUZU_PAGEBITS);
@@ -2758,8 +2778,19 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 }
                 vector_it = image_map_ids.erase(vector_it);
             }
+            if (image_map_ids.empty()) {
+                empty_pages.push_back(page);
+            }
         });
         slot_map_views.erase(map_view_id);
+    }
+    std::ranges::sort(empty_pages);
+    const auto unique_end = std::ranges::unique(empty_pages).begin();
+    for (auto page_it = empty_pages.begin(); page_it != unique_end; ++page_it) {
+        const auto page_table_it = page_table.find(*page_it);
+        if (page_table_it != page_table.end() && page_table_it->second.empty()) {
+            page_table.erase(page_table_it);
+        }
     }
     sparse_views.erase(it);
 }
@@ -2816,7 +2847,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
-    ImageBase& image = slot_images[image_id];
+    Image& image = slot_images[image_id];
     ++images_deleted;
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -2828,7 +2859,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         }
     }
     if (image.HasScaled()) {
-        total_used_memory -= GetScaledImageSizeBytes(image);
+        total_used_memory -= (std::min)(total_used_memory, GetScaledImageSizeBytes(image));
     }
     // TickFrame sets the total from the driver, which can be under the sum of these estimates.
     total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(slot_images[image_id]));
@@ -2902,7 +2933,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
 
     alloc_images.erase(alloc_image_it);
     if (alloc_images.empty()) {
-        image_allocs_table.erase(alloc_it);
+        EraseCachedSlot(slot_image_allocs, image_allocs_table, alloc_it);
     }
     for (size_t c : active_channel_ids) {
         auto& channel_info = channel_storage[c];
@@ -2944,7 +2975,7 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
                 last_framebuffer_serial = 0;
             }
             sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
-            it = framebuffers.erase(it);
+            it = EraseCachedSlot(slot_framebuffers, framebuffers, it);
         } else {
             ++it;
         }

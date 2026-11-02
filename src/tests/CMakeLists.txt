@@ -11,15 +11,31 @@ add_executable(tests
     common/fibers.cpp
     common/host_memory.cpp
     common/param_package.cpp
+    common/path_defaults.cpp
     common/range_map.cpp
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/undefined_fix.cpp
     common/unique_function.cpp
     core/core_timing.cpp
+    core/dynarmic_code_memory.cpp
+    core/deconstructed_rom_directory.cpp
+    core/romfs_build_memory.cpp
+    core/vfs_real_cache.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/descriptor_table.cpp
+    video_core/cache_entry.cpp
+    video_core/staging_buffer_policy.cpp
+    video_core/transcode_budget_policy.cpp
     video_core/ampere_returns.cpp
+    video_core/ampere_f2i.cpp
+    video_core/ampere_ldc.cpp
+    video_core/ampere_mufu.cpp
+    video_core/ampere_hsetp.cpp
+    video_core/ampere_vote.cpp
+    video_core/ampere_sured.cpp
+    shader_recompiler/compilation_memory.cpp
     input_common/calibration_configuration_job.cpp
 )
 
@@ -27,6 +43,9 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+if (TARGET dynarmic)
+    target_link_libraries(tests PRIVATE dynarmic)
+endif()
 
 add_test(NAME tests COMMAND tests)
 

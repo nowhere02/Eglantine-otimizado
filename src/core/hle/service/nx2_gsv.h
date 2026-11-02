@@ -1038,6 +1038,7 @@ public:
             // in an 18 minute session).
             {104, &INx2Vi2Session::SucceedQuietly, "Unknown104 (display \"default\")"},
             {105, &INx2Vi2Session::SucceedQuietly, "Unknown105 (display \"default\")"},
+            {107, &INx2Vi2Session::SucceedQuietly, "Unknown107 (display \"default\")"},
             {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
             {229, &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"},
         });
@@ -1111,6 +1112,10 @@ private:
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
+                if (frame > 250'000) {
+                    LOG_INFO(Service, "nx2:vi2 long present interval #{}: {} us", m_presents,
+                             frame);
+                }
             }
             m_stats.last_present = entered;
             if (++m_stats.presents == 600) {

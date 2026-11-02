@@ -21,7 +21,6 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include "common/scope_exit.h"
 
 #if defined(__linux__)
 #include <sys/random.h>
@@ -51,14 +50,18 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <random>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -144,8 +147,10 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        const char* lazy_override = std::getenv("EDEN_HOST_MEMORY_LAZY");
+        lazy_backing = lazy_override == nullptr || lazy_override[0] != '0';
+        // Reserved sections keep unused guest/GPU address ranges out of the commit charge.
+        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, lazy_backing ? SEC_RESERVE : SEC_COMMIT, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;
@@ -171,6 +176,15 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory", virtual_size >> 30);
             return false;
         }
+        if (lazy_backing) {
+            if (!RegisterBacking()) {
+                Release();
+                LOG_CRITICAL(HW_Memory, "Failed to register demand-committed backing memory");
+                return false;
+            }
+            LOG_INFO(HW_Memory, "Reserved {} MiB of backing memory; committing on first touch",
+                     backing_size >> 20);
+        }
         return true;
     }
 
@@ -184,6 +198,30 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, error {}", size, GetLastError());
         }
         return ptr;
+    }
+
+    bool ClearBackingRegion(size_t offset, size_t length, u32 fill_value) {
+        if (!lazy_backing || fill_value != 0) {
+            return false;
+        }
+        u8* current = backing_base + offset;
+        u8* const end = current + length;
+        while (current < end) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(current, &region, sizeof(region))) {
+                return false;
+            }
+            u8* const region_end = static_cast<u8*>(region.BaseAddress) + region.RegionSize;
+            u8* const next = (std::min)(region_end, end);
+            if (region.State == MEM_COMMIT) {
+                std::memset(current, 0, static_cast<size_t>(next - current));
+            } else if (region.State != MEM_RESERVE) {
+                return false;
+            }
+            // Newly committed section pages are already zero; leave untouched ranges reserved.
+            current = next;
+        }
+        return true;
     }
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
@@ -223,6 +261,14 @@ public:
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
+            // VirtualProtect requires committed pages, including ranges not touched yet.
+            if (lazy_backing &&
+                !VirtualAlloc(virtual_base + offset, protect_length, MEM_COMMIT, PAGE_READWRITE)) {
+                LOG_CRITICAL(HW_Memory, "Failed to commit pages before changing protection: {}",
+                             GetLastError());
+                ++it;
+                continue;
+            }
             DWORD old_flags{};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
@@ -243,8 +289,92 @@ public:
     u8* virtual_base{};
 
 private:
+    static LONG WINAPI CommitFault(EXCEPTION_POINTERS* exception) {
+        const auto& record = *exception->ExceptionRecord;
+        if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 ||
+            record.ExceptionInformation[0] > 1) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const DWORD saved_error = GetLastError();
+        const auto restore_error =
+            ::detail::MakeScopeGuard([saved_error] { SetLastError(saved_error); });
+        const auto address = static_cast<uintptr_t>(record.ExceptionInformation[1]);
+        std::scoped_lock lock{backing_mutex};
+        const bool owned = std::ranges::any_of(lazy_backings, [address](const Impl* backing) {
+            const auto base = reinterpret_cast<uintptr_t>(backing->backing_base);
+            const auto view = reinterpret_cast<uintptr_t>(backing->virtual_base);
+            return (address >= base && address - base < backing->backing_size) ||
+                   (address >= view && address - view < backing->virtual_size);
+        });
+        if (!owned) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) ||
+            region.Type != MEM_MAPPED || (region.Protect & PAGE_GUARD) != 0) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if (region.State == MEM_COMMIT) {
+            // Another thread can commit this page after the access faulted, before our query.
+            const DWORD protection = region.Protect & 0xff;
+            const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+                                  protection == PAGE_EXECUTE_READWRITE ||
+                                  protection == PAGE_EXECUTE_WRITECOPY;
+            const bool readable = writable || protection == PAGE_READONLY ||
+                                  protection == PAGE_EXECUTE_READ;
+            return (record.ExceptionInformation[0] == 0 ? readable : writable)
+                       ? EXCEPTION_CONTINUE_EXECUTION
+                       : EXCEPTION_CONTINUE_SEARCH;
+        }
+        if (region.State != MEM_RESERVE) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Batch commitment without crossing a mapped view or changing protected/guard pages.
+        constexpr uintptr_t BatchSize = 64 * 1024;
+        const auto region_start = reinterpret_cast<uintptr_t>(region.BaseAddress);
+        const auto begin = (std::max)(region_start, AlignDown(address, BatchSize));
+        const auto end =
+            (std::min)(region_start + region.RegionSize, AlignUp(address + 1, BatchSize));
+        if (!VirtualAlloc(reinterpret_cast<void*>(begin), end - begin, MEM_COMMIT, PAGE_READWRITE)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    bool RegisterBacking() {
+        std::scoped_lock lock{backing_mutex};
+        if (fault_handler == nullptr) {
+            fault_handler = AddVectoredExceptionHandler(1, CommitFault);
+            if (fault_handler == nullptr) {
+                return false;
+            }
+        }
+        lazy_backings.push_back(this);
+        registered_backing = true;
+        return true;
+    }
+
+    void UnregisterBacking() {
+        if (!registered_backing) {
+            return;
+        }
+        void* remove_handler{};
+        {
+            std::scoped_lock lock{backing_mutex};
+            std::erase(lazy_backings, this);
+            registered_backing = false;
+            if (lazy_backings.empty()) {
+                remove_handler = std::exchange(fault_handler, nullptr);
+            }
+        }
+        if (remove_handler != nullptr) {
+            RemoveVectoredExceptionHandler(remove_handler);
+        }
+    }
+
     /// Release all resources in the object
     void Release() {
+        UnregisterBacking();
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -253,11 +383,14 @@ private:
                 }
             }
             Coalesce(0, virtual_size);
+            placeholders.clear();
+            placeholder_host_pointers.clear();
         }
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
+            virtual_base = nullptr;
         }
         if (backing_base) {
             if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
@@ -266,9 +399,13 @@ private:
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
             }
+            backing_base = nullptr;
         }
-        if (!CloseHandle(backing_handle)) {
-            LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+        if (backing_handle) {
+            if (!CloseHandle(backing_handle)) {
+                LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+            }
+            backing_handle = nullptr;
         }
     }
 
@@ -389,6 +526,12 @@ private:
 
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
+
+    inline static std::mutex backing_mutex;
+    inline static std::vector<Impl*> lazy_backings;
+    inline static void* fault_handler{};
+    bool lazy_backing{};
+    bool registered_backing{};
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
@@ -791,6 +934,11 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+#ifdef _WIN32
+    if (impl && impl->ClearBackingRegion(physical_offset, length, fill_value)) {
+        return;
+    }
+#endif
     std::memset(backing_base + physical_offset, fill_value, length);
 }
 

@@ -58,6 +58,8 @@ public:
     ResultStatus ReadNSOModules(Modules& out_modules) override;
 
 private:
+    void EnsureRomFSLoaded();
+
     FileSys::ProgramMetadata metadata;
     FileSys::VirtualFile romfs;
     FileSys::VirtualDir dir;
@@ -68,6 +70,7 @@ private:
     std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
     u64 title_id{};
     bool override_update;
+    bool romfs_initialized{};
 
     Modules modules;
 };
