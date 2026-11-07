@@ -1191,15 +1191,57 @@ bool SyncFixEnabled() {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    // EDEN_NX2_DISPATCH_TIMING: where a native dispatch's CPU time goes (the profile's compute
+    // zone alone cannot tell a descriptor bind from a cache flush).
+    static const bool timing_enabled = std::getenv("EDEN_NX2_DISPATCH_TIMING") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    auto timing_mark = Clock::now();
+    static std::array<u64, 8> timing_us{};
+    static u64 timing_calls{};
+    static auto timing_next = Clock::now() + std::chrono::seconds{1};
+    const auto mark = [&](size_t index) {
+        if (!timing_enabled) {
+            return;
+        }
+        const auto now = Clock::now();
+        timing_us[index] +=
+            std::chrono::duration_cast<std::chrono::microseconds>(now - timing_mark).count();
+        timing_mark = now;
+    };
+    const auto report = [&] {
+        if (!timing_enabled) {
+            return;
+        }
+        ++timing_calls;
+        const auto now = Clock::now();
+        if (now < timing_next) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "nx2 dispatch timing: {} calls/s: flush_caching {}us locks {}us configure {}us "
+                 "barrier {}us record {}us copies {}us cache {}us",
+                 timing_calls, timing_us[0], timing_us[1], timing_us[2], timing_us[3], timing_us[4],
+                 timing_us[5], timing_us[6]);
+        timing_us.fill(0);
+        timing_calls = 0;
+        timing_next = now + std::chrono::seconds{1};
+    };
+    SCOPE_EXIT {
+        report();
+    };
     FlushWork();
+    mark(0);
     gpu_memory->FlushCaching();
+    mark(0);
 
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
+    mark(6);
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+    mark(1);
     // Command list pages the dispatch writes are copied for the split's front right after it.
     buffer_cache.Nx2CollectListCopies(true);
     SCOPE_EXIT {
@@ -1210,6 +1252,7 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    mark(2);
 
     const auto& qmd{kepler_compute->launch_description};
     // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
@@ -1261,12 +1304,14 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
+    mark(3);
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
+    mark(4);
     SubmitNx2ListCopies();
 
     // Log compute dispatch
