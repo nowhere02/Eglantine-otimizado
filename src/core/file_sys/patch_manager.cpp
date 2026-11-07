@@ -40,6 +40,34 @@ namespace {
 
 constexpr u32 SINGLE_BYTE_MODULUS = 0x100;
 
+/// Patches applied to a module of a known title when no mod replaces the same word. They are
+/// listed in the Add-Ons dialog too, and can be disabled there like any mod.
+struct BuiltinPatch {
+    std::string_view name;
+    u64 title_id;
+    std::string_view module;
+    std::string_view build_id;
+    size_t module_offset;
+    u32 original;
+    u32 replacement;
+};
+
+constexpr std::array BUILTIN_PATCHES{
+    // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
+    // instead of following the GPU-time controller down to a 480p floor: with the controller live,
+    // the resolution (and with it the image) visibly oscillates while the frame time swings.
+    BuiltinPatch{
+        .name = "Max Resolution (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .module_offset = 0x805BD0,
+        .original = 0x360041E8,    // tbz w8, #0, 0x80640c
+        .replacement = 0x1400020F, // b 0x80640c
+    },
+};
+
+
 constexpr std::array<const char*, 14> EXEFS_FILE_NAMES{
     "main",    "main.npdm", "rtld",    "sdk",     "subsdk0", "subsdk1", "subsdk2",
     "subsdk3", "subsdk4",   "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
@@ -460,6 +488,48 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
     }
 
+    const auto disabled = GetDisabledAddons();
+    for (const auto& patch : BUILTIN_PATCHES) {
+        if (patch.title_id != title_id || patch.module != name) {
+            continue;
+        }
+        if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
+            continue;
+        }
+        if (patch.build_id != build_id) {
+            LOG_INFO(Loader, "    - Skipping \"{}\": build id {} is not {}", patch.name, build_id,
+                     patch.build_id);
+            continue;
+        }
+        const size_t offset = sizeof(Loader::NSOHeader) + patch.module_offset;
+        const auto word_at = [offset](const std::vector<u8>& data) -> std::optional<u32> {
+            if (data.size() < offset + sizeof(u32)) {
+                return std::nullopt;
+            }
+            u32 word;
+            std::memcpy(&word, data.data() + offset, sizeof(word));
+            return word;
+        };
+        const auto original = word_at(nso);
+        if (original != patch.original) {
+            LOG_WARNING(Loader, "    - Skipping \"{}\": {}+{:#x} holds {:#010x}, expected {:#010x}",
+                        patch.name, name, patch.module_offset, original.value_or(0),
+                        patch.original);
+            continue;
+        }
+        if (const auto modded = word_at(out); modded != patch.original) {
+            LOG_INFO(Loader,
+                     "    - Skipping \"{}\": a user mod already patched {}+{:#x} to {:#010x}, "
+                     "the mod's patch is used",
+                     patch.name, name, patch.module_offset, modded.value_or(0));
+            continue;
+        }
+        std::memcpy(out.data() + offset, &patch.replacement, sizeof(patch.replacement));
+        LOG_INFO(Loader, "    - Applying built-in patch \"{}\" at {}+{:#x}", patch.name, name,
+                 patch.module_offset);
+    }
+
     if (out.size() < sizeof(Loader::NSOHeader)) {
         return nso;
     }
@@ -473,6 +543,12 @@ bool PatchManager::HasNSOPatch(const BuildID& build_id_, std::string_view name) 
     const auto build_id = build_id_raw.substr(0, build_id_raw.find_last_not_of('0') + 1);
 
     LOG_INFO(Loader, "Querying NSO patch existence for build_id={}, name={}", build_id, name);
+
+    if (std::ranges::any_of(BUILTIN_PATCHES, [&](const BuiltinPatch& patch) {
+            return patch.title_id == title_id && patch.module == name;
+        })) {
+        return true;
+    }
 
     const auto load_dir = GetModificationLoadRoot();
     if (load_dir == nullptr) {
