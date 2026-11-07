@@ -4478,6 +4478,7 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
     if (num_layers == (std::numeric_limits<s32>::max)()) {
         num_layers = 1;
     }
+    layers = static_cast<u32>(num_layers);
     renderpass_key.samples = samples;
     const bool do_resolve_color = ENABLE_MSAA_TILER_RESOLVE &&
         samples != VK_SAMPLE_COUNT_1_BIT && num_colors > 0 && runtime.device.IsTiler();

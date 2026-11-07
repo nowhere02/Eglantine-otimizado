@@ -349,6 +349,11 @@ public:
         return num_color_buffers;
     }
 
+    /// Layers the framebuffer's attachments all have (a clear must not run past them).
+    [[nodiscard]] u32 Layers() const noexcept {
+        return layers;
+    }
+
     [[nodiscard]] u32 NumImages() const noexcept {
         return num_images;
     }
@@ -397,6 +402,7 @@ private:
     VkExtent2D render_area{};
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     u32 num_color_buffers = 0;
+    u32 layers = 1;
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
