@@ -177,7 +177,32 @@ void ComputePipeline::RunBuild() {
 bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                 Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
                                 BufferCache& buffer_cache, TextureCache& texture_cache) {
+    // EDEN_NX2_DISPATCH_TIMING: which stage of the per-dispatch state build costs the time.
+    static const bool cfg_timing = std::getenv("EDEN_NX2_DISPATCH_TIMING") != nullptr;
+    using Clock = std::chrono::steady_clock;
+    auto cfg_mark_time = Clock::now();
+    static std::array<u64, 8> cfg_us{};
+    static u64 cfg_calls{};
+    static auto cfg_next = Clock::now() + std::chrono::seconds{1};
+    const auto cfg_mark = [&](size_t index) {
+        if (!cfg_timing) { return; }
+        const auto now = Clock::now();
+        cfg_us[index] += std::chrono::duration_cast<std::chrono::microseconds>(now - cfg_mark_time).count();
+        cfg_mark_time = now;
+    };
+    const auto cfg_report = [&] {
+        if (!cfg_timing) { return; }
+        ++cfg_calls;
+        const auto now = Clock::now();
+        if (now < cfg_next) { return; }
+        LOG_INFO(HW_GPU, "nx2 configure timing: {} calls/s: acquire {}us uniform {}us sync_desc {}us views {}us fill_views {}us binds {}us push {}us",
+                 cfg_calls, cfg_us[0], cfg_us[1], cfg_us[2], cfg_us[3], cfg_us[4], cfg_us[5], cfg_us[6]);
+        cfg_us.fill(0); cfg_calls = 0; cfg_next = now + std::chrono::seconds{1};
+    };
+    SCOPE_EXIT { cfg_report(); };
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+
+    cfg_mark(0);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
     buffer_cache.UnbindComputeStorageBuffers();
@@ -189,7 +214,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         ++ssbo_index;
     }
 
+    cfg_mark(1);
     texture_cache.SynchronizeDescriptors(true);
+    cfg_mark(2);
 
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
@@ -257,7 +284,9 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.image_descriptors) {
         add_image(desc, desc.is_written);
     }
+    cfg_mark(3);
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+    cfg_mark(4);
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t index{};
@@ -286,6 +315,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     buffer_cache.UpdateComputeBuffers();
     buffer_cache.BindHostComputeBuffers();
+    cfg_mark(5);
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -296,6 +326,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     const VideoCommon::ImageViewInOut* views_it{views.data()};
     PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                          views_it);
+    cfg_mark(6);
 
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
