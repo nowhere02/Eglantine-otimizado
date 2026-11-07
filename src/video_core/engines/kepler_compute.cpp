@@ -684,6 +684,9 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             if (native_upscale_input) {
                 network_skip_remaining = 32;
                 skipping = true;
+                LOG_INFO(HW_GPU, "Native network window opened: program {:#x} input {:#x} {}x{}",
+                         regs.code_loc.Address(), native_upscale_input->Address(),
+                         native_upscale_input->Width(), native_upscale_input->Height());
             }
         } else if (!replacement_input && network_skip_remaining > 0) {
             --network_skip_remaining;
