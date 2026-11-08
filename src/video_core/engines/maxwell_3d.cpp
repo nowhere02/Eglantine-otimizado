@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1428,7 +1429,19 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    // Wait only for the queued compute and copy work that can write memory
+    // (GpuSplit::WaitForWriters) instead of everything the back holds: the draws queued since
+    // cannot have written these words unless they render to them. EDEN_NX2_DMA_WAIT_WRITERS=0
+    // restores the full drain for a title that DMA-reads a target it has just drawn.
+    static const bool dma_wait_writers = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_WAIT_WRITERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (dma_wait_writers) {
+        split.WaitForWriters();
+    } else {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
